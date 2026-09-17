@@ -3,6 +3,10 @@ name: Release PostgreSQL SQLx CLI
 on:
   workflow_dispatch:
     inputs:
+      version:
+        description: Git tag, commit SHA, or crate version to build (for example 0.9.0 or v0.9.0)
+        required: true
+        type: string
       prerelease:
         description: Mark the GitHub release as a prerelease
         required: false
@@ -10,7 +14,7 @@ on:
         type: boolean
 
 concurrency:
-  group: release-postgres-sqlx-cli-${{ github.sha }}
+  group: release-postgres-sqlx-cli-${{ inputs.version }}
   cancel-in-progress: false
 
 permissions:
@@ -23,13 +27,19 @@ jobs:
     outputs:
       release_tag: ${{ steps.release.outputs.release_tag }}
       version: ${{ steps.release.outputs.version }}
+      source_sha: ${{ steps.release.outputs.source_sha }}
 
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
 
-      - name: Resolve version and tag
+      - name: Resolve source revision and tag
         id: release
         shell: bash
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
           if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
@@ -37,12 +47,35 @@ jobs:
             exit 1
           fi
 
+          requested="${REQUESTED_VERSION#v}"
+          source_ref=""
+          for candidate in "$REQUESTED_VERSION" "v${requested}" "$requested"; do
+            if git rev-parse --verify --quiet "${candidate}^{commit}" >/dev/null; then
+              source_ref="$candidate"
+              break
+            fi
+          done
+          if [[ -z "$source_ref" ]]; then
+            echo "Could not resolve '$REQUESTED_VERSION' to a git commit, tag, or crate version" >&2
+            exit 1
+          fi
+
+          git checkout --detach "$source_ref"
+          source_sha="$(git rev-parse HEAD)"
+          short_sha="${source_sha:0:7}"
           version="$(
             cargo metadata --no-deps --format-version 1 |
               jq -r '.packages[] | select(.name == "sqlx-cli") | .version'
           )"
-          short_sha="${GITHUB_SHA::7}"
+          if [[ "$requested" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-].*)?$ && "$version" != "$requested" ]]; then
+            echo "Requested version $requested does not match sqlx-cli $version at $source_ref ($source_sha)" >&2
+            exit 1
+          fi
+
+          echo "Building sqlx-cli $version from $source_ref ($source_sha)"
+          echo "Using workflow from $GITHUB_SHA"
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
           echo "release_tag=sqlx-cli-v${version}-${short_sha}" >> "$GITHUB_OUTPUT"
 
       - name: Generate release lockfile
@@ -73,6 +106,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.metadata.outputs.source_sha }}
 
       - uses: actions/download-artifact@v4
         with:
@@ -149,6 +184,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.metadata.outputs.release_tag }}
+          SOURCE_SHA: ${{ needs.metadata.outputs.source_sha }}
           PRERELEASE: ${{ inputs.prerelease }}
         run: |
           set -euo pipefail
@@ -161,7 +197,7 @@ jobs:
             artifacts/Cargo.lock \
             artifacts/SHA256SUMS \
             --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
+            --target "$SOURCE_SHA" \
             --title "$RELEASE_TAG" \
-            --notes "PostgreSQL-only SQLx CLI binaries built with Rustls from $GITHUB_SHA." \
+            --notes "PostgreSQL-only SQLx CLI binaries built with Rustls from $SOURCE_SHA using workflow $GITHUB_SHA." \
             "${args[@]}"
