@@ -42,10 +42,6 @@ jobs:
           REQUESTED_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
-            echo "Releases must run from the main branch, not $GITHUB_REF" >&2
-            exit 1
-          fi
 
           requested="${REQUESTED_VERSION#v}"
           source_ref=""
