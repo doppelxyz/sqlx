@@ -1,0 +1,146 @@
+name: Release PostgreSQL SQLx CLI
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, for example sqlx-cli-v0.9.0-doppel.1
+        required: true
+        type: string
+      prerelease:
+        description: Mark the GitHub release as a prerelease
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: release-postgres-sqlx-cli-${{ inputs.tag }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Validate release source and tag
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "Releases must run from the main branch, not $GITHUB_REF" >&2
+            exit 1
+          fi
+
+          version="$(
+            cargo metadata --no-deps --format-version 1 |
+              jq -r '.packages[] | select(.name == "sqlx-cli") | .version'
+          )"
+          expected_pattern="^sqlx-cli-v${version}-doppel\\.[0-9]+$"
+          if [[ ! "$RELEASE_TAG" =~ $expected_pattern ]]; then
+            echo "Tag must match sqlx-cli-v${version}-doppel.<number>" >&2
+            exit 1
+          fi
+
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install musl compiler
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes musl-tools
+
+      - name: Build PostgreSQL-only SQLx CLI
+        shell: bash
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: |
+          version="$(
+            cargo metadata --no-deps --format-version 1 |
+              jq -r '.packages[] | select(.name == "sqlx-cli") | .version'
+          )"
+          cargo install \
+            --locked \
+            --version "$version" \
+            --root "$RUNNER_TEMP/sqlx-cli" \
+            --no-default-features \
+            --features rustls,postgres \
+            --target "${{ matrix.target }}" \
+            sqlx-cli
+
+      - name: Verify and package binary
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          binary="$RUNNER_TEMP/sqlx-cli/bin/sqlx"
+          "$binary" --version
+          archive="sqlx-cli-${RELEASE_TAG}-${{ matrix.target }}.tar.gz"
+          tar -C "$(dirname "$binary")" -czf "$archive" sqlx
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sqlx-cli-${{ matrix.target }}
+          path: sqlx-cli-*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: sqlx-cli-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create checksums
+        run: |
+          cd artifacts
+          sha256sum ./*.tar.gz > SHA256SUMS
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -euo pipefail
+          args=()
+          if [[ "$PRERELEASE" == "true" ]]; then
+            args+=(--prerelease)
+          fi
+          gh release create "$RELEASE_TAG" \
+            artifacts/*.tar.gz \
+            artifacts/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$RELEASE_TAG" \
+            --notes "PostgreSQL-only SQLx CLI binaries built with Rustls from $GITHUB_SHA." \
+            "${args[@]}"
