@@ -3,10 +3,6 @@ name: Release PostgreSQL SQLx CLI
 on:
   workflow_dispatch:
     inputs:
-      tag:
-        description: Release tag, for example sqlx-cli-v0.9.0-doppel.1
-        required: true
-        type: string
       prerelease:
         description: Mark the GitHub release as a prerelease
         required: false
@@ -14,15 +10,44 @@ on:
         type: boolean
 
 concurrency:
-  group: release-postgres-sqlx-cli-${{ inputs.tag }}
+  group: release-postgres-sqlx-cli-${{ github.sha }}
   cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
+  metadata:
+    name: Resolve release metadata
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.release.outputs.release_tag }}
+      version: ${{ steps.release.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Resolve version and tag
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "Releases must run from the main branch, not $GITHUB_REF" >&2
+            exit 1
+          fi
+
+          version="$(
+            cargo metadata --no-deps --format-version 1 |
+              jq -r '.packages[] | select(.name == "sqlx-cli") | .version'
+          )"
+          short_sha="${GITHUB_SHA::7}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "release_tag=sqlx-cli-v${version}-${short_sha}" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build ${{ matrix.target }}
+    needs: metadata
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
 
@@ -40,27 +65,6 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Validate release source and tag
-        shell: bash
-        env:
-          RELEASE_TAG: ${{ inputs.tag }}
-        run: |
-          set -euo pipefail
-          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
-            echo "Releases must run from the main branch, not $GITHUB_REF" >&2
-            exit 1
-          fi
-
-          version="$(
-            cargo metadata --no-deps --format-version 1 |
-              jq -r '.packages[] | select(.name == "sqlx-cli") | .version'
-          )"
-          expected_pattern="^sqlx-cli-v${version}-doppel\\.[0-9]+$"
-          if [[ ! "$RELEASE_TAG" =~ $expected_pattern ]]; then
-            echo "Tag must match sqlx-cli-v${version}-doppel.<number>" >&2
-            exit 1
-          fi
-
       - name: Install Rust target
         run: rustup target add ${{ matrix.target }}
 
@@ -75,14 +79,11 @@ jobs:
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          SQLX_CLI_VERSION: ${{ needs.metadata.outputs.version }}
         run: |
-          version="$(
-            cargo metadata --no-deps --format-version 1 |
-              jq -r '.packages[] | select(.name == "sqlx-cli") | .version'
-          )"
           cargo install \
             --locked \
-            --version "$version" \
+            --version "$SQLX_CLI_VERSION" \
             --root "$RUNNER_TEMP/sqlx-cli" \
             --no-default-features \
             --features rustls,postgres \
@@ -92,7 +93,7 @@ jobs:
       - name: Verify and package binary
         shell: bash
         env:
-          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_TAG: ${{ needs.metadata.outputs.release_tag }}
         run: |
           set -euo pipefail
           binary="$RUNNER_TEMP/sqlx-cli/bin/sqlx"
@@ -108,7 +109,9 @@ jobs:
 
   release:
     name: Publish GitHub release
-    needs: build
+    needs:
+      - metadata
+      - build
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -128,7 +131,7 @@ jobs:
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_TAG: ${{ needs.metadata.outputs.release_tag }}
           PRERELEASE: ${{ inputs.prerelease }}
         run: |
           set -euo pipefail
