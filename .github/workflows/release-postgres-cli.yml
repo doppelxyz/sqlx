@@ -172,10 +172,11 @@ jobs:
           cd artifacts
           sha256sum ./*.tar.gz Cargo.lock > SHA256SUMS
 
-      # Create the git tag first. `gh release create --target <old-sha>` 403s
-      # because GitHub then requires workflows:write whenever that commit's
-      # workflow files differ from main. GITHUB_TOKEN cannot be given that
-      # scope. An existing tag lets the Releases API skip that check.
+      # Tag a commit whose .github/workflows tree matches the default branch.
+      # GITHUB_TOKEN cannot use workflows:write, which GitHub requires to create
+      # a tag or release targeting any other commit (including old source SHAs
+      # and this PR branch). The binaries are still built from SOURCE_SHA;
+      # that hash stays in the tag name and release notes.
       - name: Publish release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -184,9 +185,18 @@ jobs:
           PRERELEASE: ${{ inputs.prerelease }}
         run: |
           set -euo pipefail
+          default_branch="$(gh api "repos/${GITHUB_REPOSITORY}" --jq .default_branch)"
+          if [[ "$GITHUB_REF" == "refs/heads/${default_branch}" ]]; then
+            tag_sha="$GITHUB_SHA"
+          else
+            tag_sha="$(
+              gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${default_branch}" \
+                --jq .object.sha
+            )"
+          fi
           gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
             -f ref="refs/tags/${RELEASE_TAG}" \
-            -f sha="${SOURCE_SHA}"
+            -f sha="${tag_sha}"
           args=()
           if [[ "$PRERELEASE" == "true" ]]; then
             args+=(--prerelease)
